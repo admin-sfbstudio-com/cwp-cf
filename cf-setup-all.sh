@@ -6,6 +6,7 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+SCRIPT_PATH="/root/cf-setup-all.sh"
 APACHE_DIR="/usr/local/apache"
 HTTPD_CONF="${APACHE_DIR}/conf/httpd.conf"
 CONF_D_DIR="${APACHE_DIR}/conf.d"
@@ -19,7 +20,28 @@ SYSTEMD_OVERRIDE_FILE="${SYSTEMD_OVERRIDE_DIR}/override.conf"
 
 APACHE_RELOAD_NEEDED=false
 
-echo "=== [1/3] Configuring Apache mod_remoteip & LogFormat ==="
+echo "=== [1/4] Ensuring Script Location & CronJob ==="
+
+# 1. Ensure the script is located at /root/cf-setup-all.sh
+CURRENT_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+if [ "$CURRENT_SCRIPT_PATH" != "$SCRIPT_PATH" ]; then
+  echo "-> Copying script to ${SCRIPT_PATH}..."
+  cp "$CURRENT_SCRIPT_PATH" "$SCRIPT_PATH"
+  chmod +x "$SCRIPT_PATH"
+fi
+
+# 2. Add cron job if it doesn't already exist
+CRON_JOB="0 3 * * * ${SCRIPT_PATH} > /dev/null 2>&1"
+if crontab -l 2>/dev/null | grep -Fq "$SCRIPT_PATH"; then
+  echo "-> Cron job already exists. Skipping."
+else
+  echo "-> Adding nightly cron job to crontab..."
+  (crontab -l 2>/dev/null || true; echo "$CRON_JOB") | crontab -
+  echo "-> Cron job added successfully."
+fi
+
+echo ""
+echo "=== [2/4] Configuring Apache mod_remoteip & LogFormat ==="
 
 if [ ! -d "$APACHE_DIR" ]; then
   echo "Error: Apache directory $APACHE_DIR not found."
@@ -67,7 +89,7 @@ mkdir -p "$CONF_D_DIR"
 {
   echo "# Cloudflare mod_remoteip Configuration"
   echo "RemoteIPHeader CF-Connecting-IP"
-  for ip in $CF_IPV4_RAW $CF_IPV6_RAW; do
+  for ip in $CF_IPV4_RAW$CF_IPV6_RAW; do
     echo "RemoteIPTrustedProxy $ip"
   done
 } > "$TMP_APACHE_CONF"
@@ -92,14 +114,14 @@ else
 fi
 
 echo ""
-echo "=== [2/3] Writing Firewall Application Script ==="
+echo "=== [3/4] Writing Firewall Application Script ==="
 
 cat << 'EOF' > "$APPLY_SCRIPT"
 #!/usr/bin/env bash
 set -euo pipefail
 
-CF_IPV4=$(curl -s https://www.cloudflare.com/ips-v4 | grep -E '^[0-9]' | tr '\n' ',' | sed 's/,$//')
-CF_IPV6=$(curl -s https://www.cloudflare.com/ips-v6 | grep -E '^[0-9a-fA-F:]' | tr '\n' ',' | sed 's/,$//')
+CF_IPV4=$(curl -s https://www.cloudflare.com/ips-v4 \vert{} grep -E '^[0-9]' \vert{} tr '\n' ',' \vert{} sed 's/,$//')
+CF_IPV6=$(curl -s https://www.cloudflare.com/ips-v6 \vert{} grep -E '^[0-9a-fA-F:]' \vert{} tr '\n' ',' \vert{} sed 's/,$//')
 
 if [ -z "$CF_IPV4" ]; then
   echo "Error: Could not fetch Cloudflare IPv4 range."
@@ -138,35 +160,7 @@ chmod +x "$APPLY_SCRIPT"
 echo "-> Created ${APPLY_SCRIPT}"
 
 echo ""
-echo "=== [3/3] Setting Up Systemd Service Overrides for CSF ==="
+echo "=== [4/4] Setting Up Systemd Service Overrides for CSF ==="
 
 # 1. Clean csfpost.sh
-cat << 'EOF' > "$CSF_POST"
-#!/usr/bin/env bash
-# Managed by systemd ExecStartPost override
-EOF
-chmod +x "$CSF_POST"
-
-# 2. Configure systemd override to execute script post-CSF startup/reload
-mkdir -p "$SYSTEMD_OVERRIDE_DIR"
-
-cat << EOF > "$SYSTEMD_OVERRIDE_FILE"
-[Service]
-ExecStartPost=${APPLY_SCRIPT}
-ExecReloadPost=${APPLY_SCRIPT}
-EOF
-
-echo "-> Created ${SYSTEMD_OVERRIDE_FILE}"
-
-# 3. Reload systemd daemon and restart csf
-echo "-> Reloading systemd daemon..."
-systemctl daemon-reload
-
-echo "-> Restarting csf service..."
-systemctl restart csf
-
-echo ""
-echo "=== Deployment Complete ==="
-echo "Verification commands:"
-echo "  nft list chain ip filter INPUT | head -n 6"
-echo "  nft list chain ip filter CF_RESTRICT"
+cat << 'EOF' > "$CSF_POST
